@@ -1,7 +1,8 @@
 use rand::{thread_rng, Rng};
 use std::fs::File;
 use std::io::Write;
-use std::rc::Rc;
+use std::sync::Arc;
+use std::thread;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct Vec3 {
@@ -155,64 +156,7 @@ fn unit_vector(v: Vec3) -> Vec3 {
     v / v.length()
 }
 
-fn ray_color2(ray: &Ray, world: &impl Hittable, depth: i32) -> Color {
-    if depth <= 0 {
-        return Color::new(0.0, 0.0, 0.0);
-    }
-    match world.hit(ray, 0.001, std::f64::MAX) {
-        Some(hit_record) => {
-            let target = hit_record.p + hit_record.normal + random_in_hemisphere(hit_record.normal);
-            0.5 * ray_color(
-                &Ray {
-                    origin: hit_record.p,
-                    direction: target - hit_record.p,
-                },
-                world,
-                depth - 1,
-            )
-        }
-        None => {
-            let unit_direction = unit_vector(ray.direction);
-            let t = 0.5 * (unit_direction.y() + 1.0);
-            (1.0 - t) * Color::new(1.0, 1.0, 1.0) + t * Color::new(0.5, 0.7, 1.0)
-        }
-    }
-}
-
-fn ray_color0(ray: &Ray, world: &impl Hittable, depth: i32) -> Color {
-    match world.hit(ray, 0.001, std::f64::MAX) {
-        Some(hit_record) => {
-            let n = unit_vector(ray.at(hit_record.t) - Vec3::new(0.0, 0.0, -1.0));
-            return 0.5 * Color::new(n.x() + 1.0, n.y() + 1.0, n.z() + 1.0);
-        }
-        None => {
-            let unit_direction = unit_vector(ray.direction);
-            let t = 0.5 * (unit_direction.y() + 1.0);
-            (1.0 - t) * Color::new(1.0, 1.0, 1.0) + t * Color::new(0.5, 0.7, 1.0)
-        }
-    }
-}
-
-fn ray_color(ray: &Ray, world: &impl Hittable, depth: i32) -> Color {
-    if depth <= 0 {
-        return Color::new(0.0, 0.0, 0.0);
-    }
-    match world.hit(ray, 0.001, std::f64::MAX) {
-        Some(hit_record) => {
-            if let Some(scatter_record) = hit_record.material.scatter(&ray, &hit_record) {
-                scatter_record.attenuation * ray_color(&scatter_record.scattered, world, depth - 1)
-            } else {
-                Color::new(0.0, 0.0, 0.0)
-            }
-        }
-        None => {
-            let unit_direction = unit_vector(ray.direction);
-            let t = 0.5 * (unit_direction.y() + 1.0);
-            (1.0 - t) * Color::new(1.0, 1.0, 1.0) + t * Color::new(0.5, 0.7, 1.0)
-        }
-    }
-}
-
+#[derive(Clone, Copy)]
 struct Camera {
     aspect_ratio: f64,
     viewport_height: f64,
@@ -290,12 +234,18 @@ struct HitRecord {
     p: Point3,
     normal: Vec3,
     t: f64,
-    material: Rc<dyn Material>,
+    material: Arc<dyn Material>,
     front_face: bool,
 }
 
 impl HitRecord {
-    fn new(ray: &Ray, p: Point3, outward_normal: Vec3, t: f64, material: Rc<dyn Material>) -> Self {
+    fn new(
+        ray: &Ray,
+        p: Point3,
+        outward_normal: Vec3,
+        t: f64,
+        material: Arc<dyn Material>,
+    ) -> Self {
         let front_face = dot(ray.direction, outward_normal) < 0.0;
         let normal = if front_face {
             outward_normal
@@ -313,18 +263,18 @@ impl HitRecord {
     }
 }
 
-trait Hittable {
+trait Hittable: Send + Sync {
     fn hit(&self, ray: &Ray, t_min: f64, t_max: f64) -> Option<HitRecord>;
 }
 
 struct Sphere {
     center: Vec3,
     radius: f64,
-    material: Rc<dyn Material>,
+    material: Arc<dyn Material>,
 }
 
 impl Sphere {
-    fn new(center: Point3, radius: f64, material: Rc<dyn Material>) -> Self {
+    fn new(center: Point3, radius: f64, material: Arc<dyn Material>) -> Self {
         Sphere {
             center,
             radius,
@@ -385,7 +335,7 @@ struct ScatterRecord {
     scattered: Ray,
 }
 
-trait Material {
+trait Material: Send + Sync {
     fn scatter(&self, ray: &Ray, hit_record: &HitRecord) -> Option<ScatterRecord>;
 }
 
@@ -474,13 +424,13 @@ impl Material for Dielectric {
         let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
 
         let cannot_refract = refraction_ratio * sin_theta > 1.0;
-        let direction;
-        let mut rng = thread_rng();
-        if cannot_refract || reflectance(cos_theta, refraction_ratio) > rng.gen_range(0.0, 1.0) {
-            direction = reflect(unit_direction, hit_record.normal);
+        let direction = if cannot_refract
+            || reflectance(cos_theta, refraction_ratio) > thread_rng().gen_range(0.0, 1.0)
+        {
+            reflect(unit_direction, hit_record.normal)
         } else {
-            direction = refract(unit_direction, hit_record.normal, refraction_ratio);
-        }
+            refract(unit_direction, hit_record.normal, refraction_ratio)
+        };
 
         Some(ScatterRecord {
             scattered: Ray {
@@ -495,7 +445,7 @@ impl Material for Dielectric {
 fn random_scene() -> World {
     let mut world: World = Vec::new();
 
-    let ground_material = Rc::new(Lambertian {
+    let ground_material = Arc::new(Lambertian {
         albedo: Color::new(0.5, 0.5, 0.5),
     });
     world.push(Box::new(Sphere::new(
@@ -518,17 +468,17 @@ fn random_scene() -> World {
                 if choose_mat < 0.8 {
                     // diffuse
                     let albedo = Color::rand() * Color::rand();
-                    let sphere_material = Rc::new(Lambertian { albedo });
+                    let sphere_material = Arc::new(Lambertian { albedo });
                     world.push(Box::new(Sphere::new(center, 0.2, sphere_material)));
                 } else if choose_mat < 0.95 {
                     // metal
                     let albedo = Color::rand_range(0.5, 1.0);
                     let fuzz = rng.gen_range(0.0, 0.5);
-                    let sphere_material = Rc::new(Metal { albedo, fuzz });
+                    let sphere_material = Arc::new(Metal { albedo, fuzz });
                     world.push(Box::new(Sphere::new(center, 0.2, sphere_material)));
                 } else {
                     // glass
-                    let sphere_material = Rc::new(Dielectric {
+                    let sphere_material = Arc::new(Dielectric {
                         index_of_refraction: 1.5,
                     });
                     world.push(Box::new(Sphere::new(center, 0.2, sphere_material)));
@@ -537,7 +487,7 @@ fn random_scene() -> World {
         }
     }
 
-    let material1 = Rc::new(Dielectric {
+    let material1 = Arc::new(Dielectric {
         index_of_refraction: 1.5,
     });
     world.push(Box::new(Sphere::new(
@@ -546,7 +496,7 @@ fn random_scene() -> World {
         material1,
     )));
 
-    let material2 = Rc::new(Lambertian {
+    let material2 = Arc::new(Lambertian {
         albedo: Color::new(0.4, 0.2, 0.1),
     });
     world.push(Box::new(Sphere::new(
@@ -555,7 +505,7 @@ fn random_scene() -> World {
         material2,
     )));
 
-    let material3 = Rc::new(Metal {
+    let material3 = Arc::new(Metal {
         albedo: Color::new(0.7, 0.6, 0.5),
         fuzz: 0.0,
     });
@@ -567,6 +517,27 @@ fn random_scene() -> World {
 
     world
 }
+
+fn ray_color(ray: &Ray, world: &World, depth: u32) -> Color {
+    if depth <= 0 {
+        return Color::new(0.0, 0.0, 0.0);
+    }
+    match world.hit(ray, 0.001, std::f64::MAX) {
+        Some(hit_record) => {
+            if let Some(scatter_record) = hit_record.material.scatter(&ray, &hit_record) {
+                scatter_record.attenuation * ray_color(&scatter_record.scattered, world, depth - 1)
+            } else {
+                Color::new(0.0, 0.0, 0.0)
+            }
+        }
+        None => {
+            let unit_direction = unit_vector(ray.direction);
+            let t = 0.5 * (unit_direction.y() + 1.0);
+            (1.0 - t) * Color::new(1.0, 1.0, 1.0) + t * Color::new(0.5, 0.7, 1.0)
+        }
+    }
+}
+
 
 fn main() {
     use chrono::prelude::*;
@@ -580,8 +551,8 @@ fn main() {
 
 fn generate() {
     let aspect_ratio = 3.0 / 2.0;
-    let image_width: i32 = 800;
-    let image_height = ((image_width as f64) / aspect_ratio) as i32;
+    let image_width: u32 = 800;
+    let image_height = ((image_width as f64) / aspect_ratio) as u32;
 
     let samples_per_pixel = 100;
     let max_depth = 50;
@@ -603,79 +574,7 @@ fn generate() {
         focus_dist,
     );
 
-    /*
-    let R = (std::f64::consts::PI / 4.0).cos();
-    let world: World = vec![
-        Box::new(Sphere::new(
-            Point3::new(-R, 0.0, -1.0),
-            R,
-            Rc::new(Lambertian {
-                albedo: Color::new(1.0, 0.0, 0.0),
-            }),
-        )),
-        Box::new(Sphere::new(
-            Point3::new(R, 0.0, -1.0),
-            R,
-            Rc::new(Lambertian {
-                albedo: Color::new(0.0, 0.0, 1.0),
-            }),
-        )),
-    ];
-    */
-
-    /*
-    let world: World = vec![
-        Box::new(Sphere::new(
-            Point3::new(-1.0, 0.0, -1.0),
-            0.5,
-            Rc::new(Dielectric {
-                index_of_refraction: 1.5,
-            }),
-        )),
-        Box::new(Sphere::new(
-            Point3::new(-1.0, 0.0, -1.0),
-            -0.46,
-            Rc::new(Dielectric {
-                index_of_refraction: 1.5,
-            }),
-        )),
-        Box::new(Sphere::new(
-            Point3::new(1.0, 0.0, -1.0),
-            0.5,
-            Rc::new(Metal {
-                albedo: Color::new(0.8, 0.8, 0.8),
-                fuzz: 0.0,
-            }),
-        )),
-        /*
-        Box::new(Sphere::new(
-            Point3::new(1.0, 0.0, -1.0),
-            0.5,
-            Rc::new(Metal {
-                albedo: Color::new(0.8, 0.6, 0.2),
-                fuzz: 0.2,
-            }),
-        )), */
-        Box::new(Sphere::new(
-            Point3::new(0.0, 0.0, -1.0),
-            0.5,
-            Rc::new(Lambertian {
-                albedo: Color::new(0.1, 0.2, 0.5),
-            }),
-        )),
-        Box::new(Sphere::new(
-            Point3::new(0.0, -100.5, -1.0),
-            100.0,
-            Rc::new(Lambertian {
-                albedo: Color::new(0.8, 0.8, 0.0),
-            }),
-        )),
-    ];
-    */
-
-    let world = random_scene();
-
-    let mut rng = thread_rng();
+    let world = Arc::new(random_scene());
 
     let mut file = File::create("output.ppm").unwrap();
 
@@ -683,18 +582,85 @@ fn generate() {
     writeln!(file, "{} {}", image_width, image_height).unwrap();
     writeln!(file, "255").unwrap();
 
+    generate_multi_thread(
+        &mut file,
+        image_height,
+        image_width,
+        samples_per_pixel,
+        max_depth,
+        &camera,
+        world,
+    );
+}
+
+fn generate_multi_thread(
+    file: &mut File,
+    image_height: u32,
+    image_width: u32,
+    samples_per_pixel: u32,
+    max_depth: u32,
+    camera: &Camera,
+    world: Arc<World>,
+) {
+    let v: Vec<u32> = (0..image_height).collect();
+    let chunks = v.chunks(8);
+
+    let mut handles = Vec::new();
+    for chunk in chunks {
+        let vec: Vec<u32> = Vec::from(chunk);
+        let camera = camera.clone();
+        let world = world.clone();
+        let h = thread::spawn(move || {
+            let mut pixels = Vec::new();
+            for j in vec {
+                let j = image_height - j - 1;
+                for i in 0..image_width {
+                    let mut pixel_color = Color::new(0.0, 0.0, 0.0);
+                    for _ in 0..samples_per_pixel {
+                        let u = (i as f64 + thread_rng().gen_range(0.0, 1.0))
+                            / (image_width - 1) as f64;
+                        let v = (j as f64 + thread_rng().gen_range(0.0, 1.0))
+                            / (image_height - 1) as f64;
+
+                        let r = camera.get_ray(u, v);
+                        pixel_color = pixel_color + ray_color(&r, &world, max_depth);
+                    }
+                    pixels.push(pixel_color);
+                }
+            }
+            pixels
+        });
+        handles.push(h);
+    }
+    for h in handles {
+        let pixels = h.join().unwrap();
+        for pixel_color in pixels {
+            write_color(file, pixel_color, samples_per_pixel);
+        }
+    }
+}
+
+fn generate_single_thread(
+    file: &mut File,
+    image_height: u32,
+    image_width: u32,
+    samples_per_pixel: u32,
+    max_depth: u32,
+    camera: &Camera,
+    world: Arc<World>,
+) {
     for j in 0..image_height {
         let j = image_height - j - 1;
         for i in 0..image_width {
             let mut pixel_color = Color::new(0.0, 0.0, 0.0);
             for _ in 0..samples_per_pixel {
-                let u = (i as f64 + rng.gen_range(0.0, 1.0)) / (image_width - 1) as f64;
-                let v = (j as f64 + rng.gen_range(0.0, 1.0)) / (image_height - 1) as f64;
+                let u = (i as f64 + thread_rng().gen_range(0.0, 1.0)) / (image_width - 1) as f64;
+                let v = (j as f64 + thread_rng().gen_range(0.0, 1.0)) / (image_height - 1) as f64;
 
                 let r = camera.get_ray(u, v);
                 pixel_color = pixel_color + ray_color(&r, &world, max_depth);
             }
-            write_color(&mut file, pixel_color, samples_per_pixel);
+            write_color(file, pixel_color, samples_per_pixel);
         }
     }
 }
@@ -739,7 +705,7 @@ fn random_in_hemisphere(normal: Vec3) -> Vec3 {
     }
 }
 
-fn write_color(file: &mut File, color: Color, samples_per_pixel: i32) {
+fn write_color(file: &mut File, color: Color, samples_per_pixel: u32) {
     let scale = 1.0 / samples_per_pixel as f64;
     let r = (color.x() * scale).sqrt();
     let g = (color.y() * scale).sqrt();
