@@ -1,8 +1,10 @@
+use chrono::prelude::*;
 use rand::{thread_rng, Rng};
 use std::fs::File;
 use std::io::Write;
 use std::sync::Arc;
 use std::thread;
+use std::time::SystemTime;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
 struct Vec3 {
@@ -54,6 +56,18 @@ impl Vec3 {
 
     fn z(&self) -> f64 {
         self.e[2]
+    }
+
+    fn dot(self, v2: Vec3) -> f64 {
+        self.x() * v2.x() + self.y() * v2.y() + self.z() * v2.z()
+    }
+
+    fn cross(self, v: Vec3) -> Vec3 {
+        Vec3::new(
+            self.e[1] * v.e[2] - self.e[2] * v.e[1],
+            self.e[2] * v.e[0] - self.e[0] * v.e[2],
+            self.e[0] * v.e[1] - self.e[1] * v.e[0],
+        )
     }
 
     fn length_squared(&self) -> f64 {
@@ -129,18 +143,6 @@ impl std::ops::Mul<Vec3> for Vec3 {
     }
 }
 
-fn dot(v1: Vec3, v2: Vec3) -> f64 {
-    v1.x() * v2.x() + v1.y() * v2.y() + v1.z() * v2.z()
-}
-
-fn cross(u: Vec3, v: Vec3) -> Vec3 {
-    Vec3::new(
-        u.e[1] * v.e[2] - u.e[2] * v.e[1],
-        u.e[2] * v.e[0] - u.e[0] * v.e[2],
-        u.e[0] * v.e[1] - u.e[1] * v.e[0],
-    )
-}
-
 struct Ray {
     origin: Point3,
     direction: Vec3,
@@ -158,10 +160,6 @@ fn unit_vector(v: Vec3) -> Vec3 {
 
 #[derive(Clone, Copy)]
 struct Camera {
-    aspect_ratio: f64,
-    viewport_height: f64,
-    viewport_width: f64,
-
     origin: Point3,
     horizontal: Vec3,
     vertical: Vec3,
@@ -169,7 +167,6 @@ struct Camera {
 
     u: Vec3,
     v: Vec3,
-    w: Vec3,
     lens_radius: f64,
 }
 
@@ -193,8 +190,8 @@ impl Camera {
         let viewport_width = aspect_ratio * viewport_height;
 
         let w = unit_vector(lookfrom - lookat);
-        let u = unit_vector(cross(vup, w));
-        let v = cross(w, u);
+        let u = unit_vector(vup.cross(w));
+        let v = w.cross(u);
 
         let origin = lookfrom;
         let horizontal = focus_dist * viewport_width * u;
@@ -203,16 +200,12 @@ impl Camera {
         let lens_radius = aperture / 2.0;
 
         Camera {
-            aspect_ratio,
-            viewport_height,
-            viewport_width,
             origin,
             horizontal,
             vertical,
             lower_left_corner,
             u,
             v,
-            w,
             lens_radius,
         }
     }
@@ -246,7 +239,7 @@ impl HitRecord {
         t: f64,
         material: Arc<dyn Material>,
     ) -> Self {
-        let front_face = dot(ray.direction, outward_normal) < 0.0;
+        let front_face = ray.direction.dot(outward_normal) < 0.0;
         let normal = if front_face {
             outward_normal
         } else {
@@ -286,28 +279,26 @@ impl Sphere {
 impl Hittable for Sphere {
     fn hit(&self, ray: &Ray, t_min: f64, t_max: f64) -> Option<HitRecord> {
         let oc = ray.origin - self.center;
-        let a = dot(ray.direction, ray.direction);
-        let b = dot(oc, ray.direction);
-        let c = dot(oc, oc) - self.radius.powi(2);
+        let a = ray.direction.dot(ray.direction);
+        let b = oc.dot(ray.direction);
+        let c = oc.dot(oc) - self.radius.powi(2);
         let discriminant = b.powi(2) - a * c;
         if discriminant > 0.0 {
             let sqrtd = discriminant.sqrt();
             let t = (-b - sqrtd) / a;
-            if t < t_max && t > t_min {
-                let p = ray.at(t);
-                let normal = (p - self.center) / self.radius;
-                return Some(HitRecord::new(ray, p, normal, t, self.material.clone()));
+            if t > t_max || t < t_min {       
+                // Do not care about another root, deviating from the book (as of 8/6/2022).
+
+                // t = (-b + sqrtd) / a;
+                // if t > t_max || t < t_min {
+                //     return None;
+                // }
+                return None;
             }
-            /*
-             * I have to comment this out!
-             *
-            let t = (-b + sqrtd) / a;
-            if t < t_max && t > t_min {
-                let p = ray.at(t);
-                let normal = (p - self.center) / self.radius;
-                return Some(HitRecord::new(ray, p, normal, t, self.material.clone()));
-            }
-            */
+
+            let p = ray.at(t);
+            let normal = (p - self.center) / self.radius;
+            return Some(HitRecord::new(ray, p, normal, t, self.material.clone()));
         }
         None
     }
@@ -367,7 +358,7 @@ struct Metal {
 }
 
 fn reflect(v: Vec3, n: Vec3) -> Vec3 {
-    v - 2.0 * dot(v, n) * n
+    v - 2.0 * v.dot(n) * n
 }
 
 impl Material for Metal {
@@ -376,7 +367,7 @@ impl Material for Metal {
         if self.fuzz > 0.0 {
             reflected = reflected + self.fuzz * random_in_unit_sphere()
         };
-        if dot(reflected, hit_record.normal) > 0.0 {
+        if reflected.dot(hit_record.normal) > 0.0 {
             let scattered = Ray {
                 origin: hit_record.p,
                 direction: reflected,
@@ -390,7 +381,6 @@ impl Material for Metal {
         }
     }
 }
-
 struct Dielectric {
     index_of_refraction: f64,
 }
@@ -403,7 +393,7 @@ fn reflectance(cosine: f64, ref_idx: f64) -> f64 {
 }
 
 fn refract(uv: Vec3, n: Vec3, etai_over_etat: f64) -> Vec3 {
-    let cos_theta = dot(-1.0 * uv, n).min(1.0);
+    let cos_theta = (-1.0 * uv).dot(n).min(1.0);
     let r_out_perp = etai_over_etat * (uv + cos_theta * n);
     let r_out_parallel = -(1.0 - r_out_perp.length_squared()).abs().sqrt() * n;
     r_out_perp + r_out_parallel
@@ -420,7 +410,7 @@ impl Material for Dielectric {
 
         let unit_direction = unit_vector(ray.direction);
 
-        let cos_theta = dot(-1.0 * unit_direction, hit_record.normal).min(1.0);
+        let cos_theta = (-1.0 * unit_direction).dot(hit_record.normal).min(1.0);
         let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
 
         let cannot_refract = refraction_ratio * sin_theta > 1.0;
@@ -518,18 +508,17 @@ fn random_scene() -> World {
     world
 }
 
-fn ray_color(ray: &Ray, world: &World, depth: u32) -> Color {
+fn ray_color(ray: &Ray, world: &World, depth: usize) -> Color {
     if depth <= 0 {
         return Color::new(0.0, 0.0, 0.0);
     }
     match world.hit(ray, 0.001, std::f64::MAX) {
-        Some(hit_record) => {
-            if let Some(scatter_record) = hit_record.material.scatter(&ray, &hit_record) {
+        Some(hit_record) => hit_record.material.scatter(&ray, &hit_record).map_or(
+            Color::new(0.0, 0.0, 0.0),
+            |scatter_record| {
                 scatter_record.attenuation * ray_color(&scatter_record.scattered, world, depth - 1)
-            } else {
-                Color::new(0.0, 0.0, 0.0)
-            }
-        }
+            },
+        ),
         None => {
             let unit_direction = unit_vector(ray.direction);
             let t = 0.5 * (unit_direction.y() + 1.0);
@@ -538,131 +527,73 @@ fn ray_color(ray: &Ray, world: &World, depth: u32) -> Color {
     }
 }
 
-
-fn main() {
-    use chrono::prelude::*;
-    use std::time::SystemTime;
-
-    let now = SystemTime::now();
-    println!("Start: {:?}", Local::now());
-    generate();
-    println!("Time: {:?}", now.elapsed().unwrap());
-}
-
-fn generate() {
-    let aspect_ratio = 3.0 / 2.0;
-    let image_width: u32 = 800;
-    let image_height = ((image_width as f64) / aspect_ratio) as u32;
-
-    let samples_per_pixel = 100;
-    let max_depth = 50;
-
-    let lookfrom = Point3::new(13.0, 2.0, 3.0);
-    let lookat = Point3::new(0.0, 0.0, 0.0);
-    let vup = Vec3::new(0.0, 1.0, 0.0);
-    let focus_dist = 10.0;
-    let aperture = 0.1;
-    let vfov = 20.0;
-
-    let camera = Camera::new(
-        lookfrom,
-        lookat,
-        vup,
-        vfov,
-        aspect_ratio,
-        aperture,
-        focus_dist,
-    );
-
-    let world = Arc::new(random_scene());
-
-    let mut file = File::create("output.ppm").unwrap();
-
-    writeln!(file, "P3").unwrap();
-    writeln!(file, "{} {}", image_width, image_height).unwrap();
-    writeln!(file, "255").unwrap();
-
-    generate_multi_thread(
-        &mut file,
-        image_height,
-        image_width,
-        samples_per_pixel,
-        max_depth,
-        &camera,
-        world,
-    );
-}
-
 fn generate_multi_thread(
-    file: &mut File,
-    image_height: u32,
-    image_width: u32,
-    samples_per_pixel: u32,
-    max_depth: u32,
+    output: &mut impl Write,
+    image_height: usize,
+    image_width: usize,
     camera: &Camera,
     world: Arc<World>,
 ) {
-    let v: Vec<u32> = (0..image_height).collect();
-    let chunks = v.chunks(8);
+    let v: Vec<usize> = (0..image_height).collect();
+    let chunks = v.chunks(NUM_THREADS);
 
-    let mut handles = Vec::new();
+    let mut handles = Vec::with_capacity(NUM_THREADS);
     for chunk in chunks {
-        let vec: Vec<u32> = Vec::from(chunk);
+        let vec: Vec<usize> = Vec::from(chunk);
         let camera = camera.clone();
         let world = world.clone();
         let h = thread::spawn(move || {
-            let mut pixels = Vec::new();
-            for j in vec {
-                let j = image_height - j - 1;
-                for i in 0..image_width {
-                    let mut pixel_color = Color::new(0.0, 0.0, 0.0);
-                    for _ in 0..samples_per_pixel {
-                        let u = (i as f64 + thread_rng().gen_range(0.0, 1.0))
-                            / (image_width - 1) as f64;
-                        let v = (j as f64 + thread_rng().gen_range(0.0, 1.0))
-                            / (image_height - 1) as f64;
-
-                        let r = camera.get_ray(u, v);
-                        pixel_color = pixel_color + ray_color(&r, &world, max_depth);
-                    }
-                    pixels.push(pixel_color);
-                }
-            }
-            pixels
+            generate_for_chunk(vec, image_height, image_width, &camera, &world)
         });
         handles.push(h);
     }
     for h in handles {
         let pixels = h.join().unwrap();
         for pixel_color in pixels {
-            write_color(file, pixel_color, samples_per_pixel);
+            write_color(output, pixel_color);
         }
     }
 }
 
+#[allow(unused)]
 fn generate_single_thread(
-    file: &mut File,
-    image_height: u32,
-    image_width: u32,
-    samples_per_pixel: u32,
-    max_depth: u32,
+    output: &mut impl Write,
+    image_height: usize,
+    image_width: usize,
     camera: &Camera,
     world: Arc<World>,
 ) {
-    for j in 0..image_height {
+    let vec: Vec<usize> = (0..image_height).collect();
+    let pixels = generate_for_chunk(vec, image_height, image_width, &camera, &world);
+    for pixel_color in pixels {
+        write_color(output, pixel_color);
+    }
+}
+
+fn generate_for_chunk(
+    vec: Vec<usize>,
+    image_height: usize,
+    image_width: usize,
+    camera: &Camera,
+    world: &World,
+) -> Vec<Vec3> {
+    let mut rng = thread_rng();
+    let mut pixels = Vec::with_capacity(vec.len() * image_width);
+    for j in vec {
         let j = image_height - j - 1;
         for i in 0..image_width {
             let mut pixel_color = Color::new(0.0, 0.0, 0.0);
-            for _ in 0..samples_per_pixel {
-                let u = (i as f64 + thread_rng().gen_range(0.0, 1.0)) / (image_width - 1) as f64;
-                let v = (j as f64 + thread_rng().gen_range(0.0, 1.0)) / (image_height - 1) as f64;
+            for _ in 0..SAMPLES_PER_PIXEL {
+                let u = (i as f64 + rng.gen_range(0.0, 1.0)) / (image_width - 1) as f64;
+                let v = (j as f64 + rng.gen_range(0.0, 1.0)) / (image_height - 1) as f64;
 
                 let r = camera.get_ray(u, v);
-                pixel_color = pixel_color + ray_color(&r, &world, max_depth);
+                pixel_color = pixel_color + ray_color(&r, &world, MAX_DEPTH);
             }
-            write_color(file, pixel_color, samples_per_pixel);
+            pixels.push(pixel_color);
         }
     }
+    pixels
 }
 
 fn clamp(x: f64, min: f64, max: f64) -> f64 {
@@ -696,26 +627,61 @@ fn random_in_unit_disk() -> Vec3 {
     }
 }
 
-fn random_in_hemisphere(normal: Vec3) -> Vec3 {
-    let in_unit_sphere = random_in_unit_sphere();
-    if dot(in_unit_sphere, normal) > 0.0 {
-        in_unit_sphere
-    } else {
-        -1.0 * in_unit_sphere
-    }
-}
-
-fn write_color(file: &mut File, color: Color, samples_per_pixel: u32) {
-    let scale = 1.0 / samples_per_pixel as f64;
+fn write_color(output: &mut impl Write, color: Color) {
+    let scale = 1.0 / SAMPLES_PER_PIXEL as f64;
     let r = (color.x() * scale).sqrt();
     let g = (color.y() * scale).sqrt();
     let b = (color.z() * scale).sqrt();
     writeln!(
-        file,
+        output,
         "{} {} {}",
         (clamp(r, 0.0, 1.0) * 255.99) as u8,
         (clamp(g, 0.0, 1.0) * 255.99) as u8,
         (clamp(b, 0.0, 1.0) * 255.99) as u8
     )
     .unwrap();
+}
+
+const MAX_DEPTH: usize = 50;
+const SAMPLES_PER_PIXEL: usize = 100;
+
+const NUM_THREADS: usize = 8;
+
+fn main() {
+    let now = SystemTime::now();
+    eprintln!("Start: {:?}", Local::now());
+
+    //let mut file = File::create("output.ppm").unwrap();
+    let mut file = std::io::stdout();
+
+    let image_width: usize = 400;
+    let image_height = 200;
+    let aspect_ratio = image_width as f64 / image_height as f64;
+
+    let lookfrom = Point3::new(13.0, 2.0, 3.0);
+    let lookat = Point3::new(0.0, 0.0, 0.0);
+    let vup = Vec3::new(0.0, 1.0, 0.0);
+    let focus_dist = 10.0;
+    let aperture = 0.1;
+    let vfov = 20.0;
+
+    let camera = Camera::new(
+        lookfrom,
+        lookat,
+        vup,
+        vfov,
+        aspect_ratio,
+        aperture,
+        focus_dist,
+    );
+
+    let world = Arc::new(random_scene());
+
+    writeln!(&mut file, "P3").unwrap();
+    writeln!(&mut file, "{} {}", image_width, image_height).unwrap();
+    writeln!(&mut file, "255").unwrap();
+
+    generate_multi_thread(&mut file, image_height, image_width, &camera, world);
+
+    eprintln!("Time: {:?}", now.elapsed().unwrap());
 }
